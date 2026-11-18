@@ -1,4 +1,7 @@
-"""FastAPI application: a two-connection read-only fault-log query API.
+"""FastAPI application: read-only fault-log queries plus retention cleanup.
+
+The read-only side keeps exactly two PostgreSQL connections; the retention
+side (``/retention/step``) uses a separate writable maintenance connection.
 
 Run locally::
 
@@ -19,7 +22,14 @@ from .config import settings
 from .errors import InvalidDeadlineError, QueryServiceError
 from .executor import QueryExecutor
 from .pool import QueryConnectionPool
-from .schemas import HealthResponse, QueryRequest, QueryResponse
+from .retention import MaintenanceConnection
+from .schemas import (
+    HealthResponse,
+    QueryRequest,
+    QueryResponse,
+    RetentionStepRequest,
+    RetentionStepResponse,
+)
 from .validation import validate_single_select
 
 logging.basicConfig(
@@ -30,26 +40,33 @@ logger = logging.getLogger("api")
 
 pool = QueryConnectionPool(settings)
 executor = QueryExecutor(pool, settings)
+# Independent writable connection for retention cleanup; never borrows from
+# the two-connection read-only query pool.
+maintenance = MaintenanceConnection(settings)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Eagerly open both connections at startup; close them on shutdown.
+    # Eagerly open both read-only connections and the maintenance connection
+    # at startup; close them on shutdown.
     await pool.open()
+    await maintenance.open()
     try:
         yield
     finally:
+        await maintenance.close()
         await pool.close()
 
 
 app = FastAPI(
-    title="机房设备故障日志只读查询 API",
+    title="机房设备故障日志查询与保留期清理 API",
     description=(
         "值班分析员共用的只读 SQL 查询入口。固定两条 PostgreSQL 连接，"
         "提交单条 SELECT 与总截止时间；排队时间计入预算，超时立即取消语句，"
         "确认事务结束才复用连接，无法确认则弃置并补建。"
+        "另有独立维护连接支撑 /retention/step 分批清理，不占用查询连接。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -93,6 +110,7 @@ async def health() -> HealthResponse:
             "total_discarded": status.total_discarded,
             "closed": status.closed,
         },
+        maintenance=await maintenance.status(),
     )
 
 
@@ -120,3 +138,26 @@ async def query(body: QueryRequest) -> QueryResponse:
     # acquire_timeout; an execution deadline as a 504 query_timeout.
     result = await executor.execute(sql, deadline)
     return QueryResponse(**result)
+
+
+@app.post(
+    "/retention/step",
+    response_model=RetentionStepResponse,
+    tags=["保留期清理"],
+    responses={
+        409: {"description": "截止时间冲突 / 跳步 / 任务已完成，本次未删除任何记录"},
+        422: {"description": "请求体不合法（缺时区、step_no 小于 1 等）"},
+        500: {"description": "维护连接或事务失败，已回滚、进度不推进"},
+    },
+)
+async def retention_step(body: RetentionStepRequest) -> RetentionStepResponse:
+    """执行一个保留期清理步骤（独立维护连接，每步最多删除 50 条）。
+
+    步骤必须按序提交；已提交过的步骤重试时返回原始回执且不再删除；
+    截止时间冲突、跳步或任务已完成都会在删除前被拒绝。删除、进度与
+    回执在同一事务提交，服务重启后凭任务 ID 即可接续。
+    """
+    result = await maintenance.run_step(
+        body.task_id, body.cutoff_at, body.step_no
+    )
+    return RetentionStepResponse(**result)

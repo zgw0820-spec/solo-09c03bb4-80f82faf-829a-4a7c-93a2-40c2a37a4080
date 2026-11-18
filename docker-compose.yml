@@ -23,6 +23,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_DSN: postgresql://fault_ro:fault_ro@db:5432/faultdb
+      # 独立维护连接：可写角色，仅用于 /retention/step，不占两条只读连接。
+      MAINTENANCE_DSN: postgresql://fault_maint:fault_maint@db:5432/faultdb
+      # 管理 DSN 仅供容器内自测脚本核对数据/制造混沌场景使用。
+      ADMIN_DSN: postgresql://fault_admin:fault_admin@db:5432/faultdb
       POOL_SIZE: "2"
     ports:
       - "8000:8000"

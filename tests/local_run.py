@@ -40,21 +40,34 @@ def _with_dbname(dsn: str, dbname: str) -> str:
 
 
 def main() -> None:
-    data_dir = tempfile.mkdtemp(prefix="faultdb-")
-    print(f"[local_run] starting ephemeral PostgreSQL in {data_dir}")
+    # Stable data directory: re-running this launcher (a simulated service
+    # restart) reuses the same PostgreSQL data, so retention progress and
+    # receipts survive restarts just like the Compose named volume does.
+    data_dir = os.environ.get(
+        "PGSERVER_DATA_DIR",
+        str(pathlib.Path(tempfile.gettempdir()) / "faultdb-persistent"),
+    )
+    pathlib.Path(data_dir).mkdir(parents=True, exist_ok=True)
+    fresh = not list(pathlib.Path(data_dir).iterdir())
+    print(f"[local_run] starting PostgreSQL in {data_dir} (fresh={fresh})")
     pg = pgserver.get_server(data_dir, cleanup_mode="stop")
     admin_dsn = pg.get_uri()
     print(f"[local_run] postgres up: {admin_dsn}")
 
+    # On a fresh cluster the database and schema must be created; on an
+    # existing one everything (including retention state) is already there.
     with psycopg.connect(admin_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute("CREATE DATABASE faultdb")
+            cur.execute("SELECT 1 FROM pg_database WHERE datname='faultdb'")
+            if cur.fetchone() is None:
+                cur.execute("CREATE DATABASE faultdb")
 
     fault_admin_dsn = _with_dbname(admin_dsn, "faultdb")
     with psycopg.connect(fault_admin_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
+            # The DDL itself is idempotent (IF NOT EXISTS / guarded roles).
             cur.execute(DDL)
-    print("[local_run] schema and fault_ro role ready")
+    print("[local_run] schema and roles ready")
 
     # pgserver authenticates over a unix socket; point the API at the same
     # socket but under the read-only role (password cleared for local use).
@@ -65,9 +78,17 @@ def main() -> None:
     with psycopg.connect(fault_admin_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER ROLE fault_ro PASSWORD NULL")
+            cur.execute("ALTER ROLE fault_maint PASSWORD NULL")
     print(f"[local_run] read-only DSN={ro_dsn}")
 
+    # The maintenance connection uses the same socket under fault_maint.
+    maint_dsn = urlunparse(ro_parts._replace(netloc=ro_parts.netloc.replace(
+        ro_parts.username or "postgres", "fault_maint", 1
+    )))
+
     os.environ["DATABASE_DSN"] = ro_dsn
+    os.environ["MAINTENANCE_DSN"] = maint_dsn
+    os.environ["ADMIN_DSN"] = fault_admin_dsn
     os.environ["POOL_SIZE"] = "2"
     # Exposed for tests/selftest.py's discard/rebuild chaos scenario.
     admin_dsn_path = pathlib.Path(tempfile.gettempdir()) / "faultdb_admin_dsn"

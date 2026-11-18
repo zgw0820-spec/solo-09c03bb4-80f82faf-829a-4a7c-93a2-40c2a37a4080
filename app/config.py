@@ -32,8 +32,17 @@ class Settings:
         "DATABASE_DSN",
         "postgresql://fault_ro:fault_ro@db:5432/faultdb",
     )
+    # Independent connection used *only* by the retention/cleanup workflow.
+    # It belongs to a writable role and is intentionally separate from the
+    # two read-only query connections, so cleanup never blocks /query.
+    maintenance_dsn: str = os.environ.get(
+        "MAINTENANCE_DSN",
+        "postgresql://fault_maint:fault_maint@db:5432/faultdb",
+    )
     pool_size: int = _int("POOL_SIZE", 2)
     connect_timeout: float = _float("CONNECT_TIMEOUT", 10.0)
+    # Upper bound on rows deleted by a single /retention/step call.
+    retention_step_limit: int = _int("RETENTION_STEP_LIMIT", 50)
     # Server-side statement_timeout acts only as a backstop.  It is set
     # slightly beyond the request deadline so application-side cancellation
     # is the primary mechanism and the backstop fires only if that fails.
